@@ -8,6 +8,7 @@ import logging
 from functools import cache
 from typing import Any
 
+import click
 from rich.console import Console
 from rich.status import Status
 
@@ -19,6 +20,7 @@ from sunbeam.commands.configure import (
     CLOUD_CONFIG_SECTION,
     PCI_CONFIG_SECTION,
     BaseConfigDPDKStep,
+    ConfigureOpenStackNetworkAgentsLocalSettingsStep,
     SetHypervisorUnitsOptionsStep,
 )
 from sunbeam.core.common import (
@@ -28,7 +30,11 @@ from sunbeam.core.common import (
     SunbeamException,
     parse_ip_range_or_cidr,
 )
-from sunbeam.core.juju import ActionFailedException, JujuHelper
+from sunbeam.core.juju import (
+    ActionFailedException,
+    JujuHelper,
+    UnitNotFoundException,
+)
 from sunbeam.core.manifest import Manifest
 from sunbeam.provider.common import nic_utils
 from sunbeam.steps import hypervisor
@@ -181,6 +187,7 @@ class LocalSetHypervisorUnitsOptionsStep(SetHypervisorUnitsOptionsStep):
                 )
                 self.nics[host] = nic
                 return
+
             self.nics[host] = self.prompt_for_nic(console)
 
 
@@ -302,7 +309,7 @@ class LocalConfigSRIOVStep(BaseStep):
         self.should_skip = False
         self.clear_previous_config = clear_previous_config
 
-    def prompt(
+    def prompt(  # noqa: C901
         self,
         console: Console | None = None,
         show_hint: bool = False,
@@ -364,6 +371,33 @@ class LocalConfigSRIOVStep(BaseStep):
         if not self.accept_defaults:
             self._do_prompt(pci_whitelist, excluded_devices, show_hint)
 
+        LOG.info("Updated PCI device whitelist: %s", pci_whitelist)
+        LOG.info("Updated PCI device exclusion list: %s", excluded_devices)
+
+        # Handle PCI passthrough devices
+        # All GPU devices returned by openstack-hypervisor will be added
+        # as PCI passthrough devices to pci_whitelist.
+        try:
+            snap_gpus = nic_utils.fetch_gpus(
+                self.client, self.node_name, self.jhelper, self.model
+            )
+        except (UnitNotFoundException, ActionFailedException) as e:
+            LOG.debug(
+                f"Failed fetching GPUs from node {self.node_name}",
+                exc_info=True,
+            )
+            raise click.ClickException(
+                f"Failed in fetching GPUs from node {self.node_name}"
+            ) from e
+
+        for snap_gpu in snap_gpus["gpus"]:
+            nic_utils.whitelist_pci_passthrough_device(
+                self.node_name, snap_gpu, pci_whitelist, excluded_devices
+            )
+
+        LOG.info(
+            "PCI device whitelist information after handling PCI passthrough devices:"
+        )
         LOG.info("Updated PCI device whitelist: %s", pci_whitelist)
         LOG.info("Updated PCI device exclusion list: %s", excluded_devices)
 
@@ -757,3 +791,107 @@ class LocalConfigDPDKStep(BaseConfigDPDKStep):
             return Result(ResultType.FAILED, msg)
 
         return Result(ResultType.COMPLETED)
+
+
+def network_node_questions():
+    return {
+        "external_interface": sunbeam.core.questions.PromptQuestion(
+            "External network's interface",
+            description=(
+                "Interface used by networking layer to allow remote access to cloud"
+                " instances. This interface must be unconfigured"
+                " (no IP address assigned) and connected to the external network."
+            ),
+        ),
+    }
+
+
+class LocalConfigureOpenStackNetworkAgentsStep(
+    ConfigureOpenStackNetworkAgentsLocalSettingsStep
+):
+    """Prompt for external interface (or use manifest) and configure agents."""
+
+    def __init__(
+        self,
+        client: Client,
+        node_name: str,
+        jhelper: JujuHelper,
+        model: str,
+        manifest: Manifest | None = None,
+        accept_defaults: bool = False,
+        bridge_name: str = "br-ex",
+        physnet_name: str = "physnet1",
+        enable_chassis_as_gw: bool = True,
+    ):
+        super().__init__(
+            client=client,
+            names=[node_name],
+            jhelper=jhelper,
+            bridge_name=bridge_name,
+            physnet_name=physnet_name,
+            model=model,
+            enable_chassis_as_gw=enable_chassis_as_gw,
+        )
+        self.client = client
+        self.node_name = node_name
+        self.manifest = manifest
+        self.accept_defaults = accept_defaults
+
+    def has_prompts(self) -> bool:
+        """Returns true if the step has prompts that it can ask the user."""
+        return True
+
+    def _prompt_for_external_nic(self, console: Console | None) -> str:
+        candidates: list[str] = []
+        all_nics: list[dict] = []
+
+        qbank = sunbeam.core.questions.QuestionBank(
+            questions=network_node_questions(),
+            console=console,
+            accept_defaults=self.accept_defaults,
+        )
+
+        if not candidates:
+            return qbank.external_interface.ask()
+
+        while True:
+            nic = qbank.external_interface.ask(
+                new_default=candidates[0], new_choices=candidates
+            )
+            if not nic:
+                continue
+            state = next((i for i in all_nics if i.get("name") == nic), None) or {}
+            if state.get("configured"):
+                if not sunbeam.core.questions.ConfirmQuestion(
+                    f"WARNING: Interface {nic} is configured. "
+                    "Any configuration will be lost. Continue?"
+                ).ask():
+                    continue
+            if state.get("up") and not state.get("connected"):
+                if not sunbeam.core.questions.ConfirmQuestion(
+                    f"WARNING: Interface {nic} is not detected as connected. Continue?",
+                    description="It may not work as expected.",
+                ).ask():
+                    continue
+            return nic
+
+    def prompt(self, console: Console | None = None, show_hint: bool = False) -> None:
+        """Prompt for external interface if not provided in manifest."""
+        if self.manifest and (ext := self.manifest.core.config.external_network):
+            hostmap = (ext.nics or {}) if hasattr(ext, "nics") else {}
+            nic = hostmap.get(self.node_name)
+            if not nic and hasattr(ext, "nic"):
+                nic = getattr(ext, "nic")
+            if nic:
+                self.external_interfaces[self.node_name] = nic
+                return
+        self.external_interfaces[self.node_name] = self._prompt_for_external_nic(
+            console
+        )
+
+    def run(self, status: Status | None = None) -> Result:
+        """Configure openstack-network-agents local settings via action."""
+        if not self.external_interfaces.get(self.node_name):
+            return Result(ResultType.FAILED, "No external interface selected")
+
+        return super().run(status)

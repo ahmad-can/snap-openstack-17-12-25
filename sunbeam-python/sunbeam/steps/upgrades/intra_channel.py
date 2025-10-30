@@ -17,6 +17,7 @@ from sunbeam.steps.cinder_volume import DeployCinderVolumeApplicationStep
 from sunbeam.steps.hypervisor import ReapplyHypervisorTerraformPlanStep
 from sunbeam.steps.k8s import DeployK8SApplicationStep
 from sunbeam.steps.microceph import DeployMicrocephApplicationStep
+from sunbeam.steps.microovn import DeployMicroOVNApplicationStep
 from sunbeam.steps.openstack import (
     OpenStackPatchLoadBalancerServicesIPPoolStep,
     OpenStackPatchLoadBalancerServicesIPStep,
@@ -146,7 +147,6 @@ class LatestInChannelCoordinator(UpgradeCoordinator):
                 self.jhelper,
                 self.manifest,
                 self.deployment.openstack_machines_model,
-                refresh=True,
             ),
         ]
 
@@ -179,6 +179,15 @@ class LatestInChannelCoordinator(UpgradeCoordinator):
 
         plan.extend(
             [
+                TerraformInitStep(self.deployment.get_tfhelper("microovn-plan")),
+                DeployMicroOVNApplicationStep(
+                    self.deployment,
+                    self.client,
+                    self.deployment.get_tfhelper("microovn-plan"),
+                    self.jhelper,
+                    self.manifest,
+                    self.deployment.openstack_machines_model,
+                ),
                 TerraformInitStep(self.deployment.get_tfhelper("microceph-plan")),
                 DeployMicrocephApplicationStep(
                     self.deployment,
@@ -187,7 +196,6 @@ class LatestInChannelCoordinator(UpgradeCoordinator):
                     self.jhelper,
                     self.manifest,
                     self.deployment.openstack_machines_model,
-                    refresh=True,
                 ),
                 TerraformInitStep(self.deployment.get_tfhelper("cinder-volume-plan")),
                 DeployCinderVolumeApplicationStep(
@@ -197,7 +205,6 @@ class LatestInChannelCoordinator(UpgradeCoordinator):
                     self.jhelper,
                     self.manifest,
                     self.deployment.openstack_machines_model,
-                    refresh=True,
                 ),
                 TerraformInitStep(self.deployment.get_tfhelper("hypervisor-plan")),
                 ReapplyHypervisorTerraformPlanStep(

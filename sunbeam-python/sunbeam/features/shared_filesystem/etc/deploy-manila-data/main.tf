@@ -5,7 +5,7 @@ terraform {
   required_providers {
     juju = {
       source  = "juju/juju"
-      version = "= 0.20.0"
+      version = "= 0.23.1"
     }
   }
 }
@@ -20,7 +20,8 @@ resource "juju_application" "manila-data" {
   name  = "manila-data"
   trust = true
   model = data.juju_model.machine_model.name
-  units = length(var.machine_ids)
+  machines = length(var.machine_ids) == 0 ? null : toset(var.machine_ids)
+  units    = length(var.machine_ids) == 0 ? 0 : null
 
   charm {
     name     = "manila-data"

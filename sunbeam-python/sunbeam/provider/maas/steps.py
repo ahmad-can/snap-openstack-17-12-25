@@ -15,6 +15,7 @@ import typing
 from pathlib import Path
 from typing import Sequence, Tuple
 
+import click
 import tenacity
 from rich.console import Console
 from rich.status import Status
@@ -33,6 +34,7 @@ from sunbeam.commands.configure import (
     PCI_CONFIG_SECTION,
     VARIABLE_DEFAULTS,
     BaseConfigDPDKStep,
+    ConfigureOpenStackNetworkAgentsLocalSettingsStep,
     SetHypervisorUnitsOptionsStep,
     ext_net_questions,
 )
@@ -405,8 +407,11 @@ class MachineComputeNicCheck(DiagnosticsCheck):
                 machine=self.machine["hostname"],
             )
         compute_tag = maas_deployment.NicTags.COMPUTE.value
-        if maas_deployment.RoleTags.COMPUTE.value not in assigned_roles:
-            self.message = "not a compute node."
+        if (
+            maas_deployment.RoleTags.COMPUTE.value not in assigned_roles
+            and maas_deployment.RoleTags.NETWORK.value not in assigned_roles
+        ):
+            self.message = "not a compute or network node."
             return DiagnosticsResult.success(
                 self.name,
                 self.message,
@@ -1344,6 +1349,7 @@ class MaasAddMachinesToClusterdStep(BaseStep):
                     maas_deployment.RoleTags.CONTROL.value,
                     maas_deployment.RoleTags.COMPUTE.value,
                     maas_deployment.RoleTags.STORAGE.value,
+                    maas_deployment.RoleTags.NETWORK.value,
                 }
             ):
                 filtered_machines.append(machine)
@@ -1932,6 +1938,78 @@ class MaasSetHypervisorUnitsOptionsStep(SetHypervisorUnitsOptionsStep):
         return Result(ResultType.COMPLETED)
 
 
+class MaasConfigureOpenstackNetworkAgentsStep(
+    ConfigureOpenStackNetworkAgentsLocalSettingsStep
+):
+    """Configure OpenStack network agents settings on the machine."""
+
+    def __init__(
+        self,
+        client: Client,
+        maas_client: maas_client.MaasClient,
+        names: list[str],
+        jhelper: JujuHelper,
+        model: str,
+        bridge_name: str,
+        physnet_name: str,
+        enable_chassis_as_gw: bool = True,
+    ):
+        super().__init__(
+            client=client,
+            names=names,
+            jhelper=jhelper,
+            bridge_name=bridge_name,
+            physnet_name=physnet_name,
+            model=model,
+            enable_chassis_as_gw=enable_chassis_as_gw,
+        )
+        self.maas_client = maas_client
+
+    def _get_maas_nics(self) -> dict[str, str | None]:
+        """Retrieve first nic from MAAS per machine with network tag.
+
+        Return a dict of format:
+            {
+                "<machine>": "<nic1_name>" | None
+            }
+        """
+        machines = maas_client.list_machines(self.maas_client, hostname=self.names)
+        nics = {}
+        for machine in machines:
+            machine_nics = [
+                nic["name"]
+                for nic in machine["nics"]
+                if maas_deployment.NicTags.COMPUTE.value in nic["tags"]
+            ]
+
+            if len(machine_nics) > 0:
+                nic = machine_nics[0]
+            else:
+                nic = None
+            nics[machine["hostname"]] = nic
+
+        return nics
+
+    def is_skip(self, status: Status | None = None):
+        """Determines if the step should be skipped or not."""
+        result = super().is_skip(status)
+        if result.result_type == ResultType.FAILED:
+            return result
+        nics = self._get_maas_nics()
+        LOG.debug("Nics: %r", nics)
+
+        for machine, nic in nics.items():
+            if nic is None:
+                nic_tag = maas_deployment.NicTags.COMPUTE.value
+                return Result(
+                    ResultType.FAILED,
+                    f"Machine {machine} does not have any {nic_tag} nic defined.",
+                )
+
+        self.external_interfaces = nics
+        return Result(ResultType.COMPLETED)
+
+
 class MaasUserQuestions(BaseStep):
     """Ask user configuration questions."""
 
@@ -2260,6 +2338,30 @@ class MaasConfigSRIOVStep(BaseStep):
                 else:
                     # Add to the per-node exclusion list.
                     nic_utils.exclude_sriov_nic(node_name, snap_nic, excluded_devices)
+
+            # Handle PCI passthrough devices
+            # All GPU devices returned by openstack-hypervisor will be added
+            # as PCI passthrough devices to pci_whitelist.
+            # openstack-hypervisor currently returns all devices that are intended
+            # for PCI passthrough as vGPU is not yet supported. So no filtering is
+            # reuired on devices returned from openstack-hypervisor.
+            try:
+                snap_gpus = nic_utils.fetch_gpus(
+                    self.client, node_name, self.jhelper, self.model
+                )
+            except (UnitNotFoundException, ActionFailedException) as e:
+                LOG.debug(
+                    f"Failed fetching GPUs from node {node_name}",
+                    exc_info=True,
+                )
+                raise click.ClickException(
+                    f"Failed in fetching GPUs from node {node_name}"
+                ) from e
+
+            for snap_gpu in snap_gpus["gpus"]:
+                nic_utils.whitelist_pci_passthrough_device(
+                    node_name, snap_gpu, pci_whitelist, excluded_devices
+                )
 
         return pci_whitelist, excluded_devices
 

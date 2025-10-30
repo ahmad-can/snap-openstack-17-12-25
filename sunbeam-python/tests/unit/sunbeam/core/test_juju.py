@@ -311,54 +311,6 @@ def test_get_space_networks_invalid_cidr(jhelper, juju):
         jhelper.get_space_networks("test-model", "space")
 
 
-def test_create_offer(jhelper, juju):
-    juju.offer.side_effect = jubilant.CLIError(1, "offer", stderr="expected")
-
-    with pytest.raises(jujulib.JujuException):
-        jhelper.create_offer("test-model", "foo", "lish")
-
-    juju.offer.assert_called_once_with(
-        "admin/test-model.foo", endpoint="lish", name=None
-    )
-
-
-def test_remove_offer(jhelper, juju):
-    juju.cli.side_effect = (
-        None,
-        jubilant.CLIError(1, "remove-offer", stderr="expected"),
-    )
-
-    with pytest.raises(jujulib.JujuException):
-        jhelper.remove_offer("test-model", "foo")
-
-    juju.cli.assert_called_with(
-        "remove-offer", "admin/test-model.foo", include_model=False
-    )
-
-
-def test_offer_exists_true(jhelper, juju):
-    result = jhelper.offer_exists("test-model", "foo")
-
-    assert result
-    juju.cli.assert_called_once_with("show-offer", "admin/test-model.foo")
-
-
-def test_offer_exists_false(jhelper, juju):
-    juju.cli.side_effect = jubilant.CLIError(1, "show-offer", stderr="not found")
-
-    result = jhelper.offer_exists("test-model", "foo")
-
-    assert not result
-    juju.cli.assert_called_once_with("show-offer", "admin/test-model.foo")
-
-
-def test_offer_exists_fail(jhelper, juju):
-    juju.cli.side_effect = jubilant.CLIError(1, "show-offer", stderr="unexpected")
-
-    with pytest.raises(jujulib.JujuException):
-        jhelper.offer_exists("test-model", "foo")
-
-
 def test_remove_saas_success(jhelper, juju):
     jhelper.remove_saas("test-model", "saas1")
     juju.cli.assert_called()
@@ -658,6 +610,28 @@ class TestJujuStepHelper:
         assert not jsh.channel_update_needed("2023.2/stable", "2023.1/stable")
         assert not jsh.channel_update_needed("latest/stable", "latest/stable")
         assert not jsh.channel_update_needed("foo/stable", "ba/stable")
+
+    def test_find_subordinate_unit_for(self):
+        jhelper = jujulib.JujuStepHelper()
+        jhelper.jhelper = Mock()
+
+        status = Mock()
+        principal_unit = Mock()
+        principal_unit.machine = "1"
+        principal_unit.subordinates = {"sub/0": Mock()}
+
+        principal_app = Mock()
+        principal_app.units = {"app1/0": principal_unit}
+
+        sub_app = Mock()
+        sub_app.units = {"sub/0": Mock(machine="1")}
+
+        status.apps = {"app1": principal_app, "sub": sub_app}
+        jhelper.jhelper.get_model_status.return_value = status
+
+        assert (
+            jhelper.find_subordinate_unit_for("app1/0", "sub", "test-model") == "sub/0"
+        )
 
 
 class TestJujuActionHelper:

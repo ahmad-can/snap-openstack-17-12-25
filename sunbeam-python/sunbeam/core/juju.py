@@ -1491,60 +1491,6 @@ class JujuHelper:
 
         return cidrs
 
-    def create_offer(
-        self,
-        model: str,
-        application_name: str,
-        endpoint: str,
-        offer_name: None | str = None,
-    ):
-        """Create an offer.
-
-        This function creates a juju offer for the given application and endpoint.
-        """
-        _model = self.get_model(model)["name"]  # ensure model is long name
-        try:
-            # Juju offer does not accept --model option, so switch the model explicitly
-            self._juju.cli("switch", _model, include_model=False)
-            self._juju.offer(
-                f"{_model}.{application_name}",
-                endpoint=endpoint,
-                name=offer_name,
-            )
-        except jubilant.CLIError as e:
-            raise JujuException(
-                f"Failed to create offer for "
-                f"{_model}.{application_name}:{endpoint}: {str(e)}"
-            ) from e
-
-    def remove_offer(self, model: str, offer_name: str):
-        """Remove a juju offer."""
-        _model = self.get_model(model)["name"]  # ensure model is long name
-        offer_url = f"{_model}.{offer_name}"
-        try:
-            self._juju.cli("switch", _model, include_model=False)
-            self._juju.cli("remove-offer", offer_url, include_model=False)
-        except jubilant.CLIError as e:
-            raise JujuException(f"Failed to remove offer {offer_url}: {str(e)}") from e
-
-    def offer_exists(self, model: str, offer_name: str) -> bool:
-        """Checks whether a juju offer exists."""
-        _model = self.get_model(model)["name"]  # ensure model is long name
-        offer_url = f"{_model}.{offer_name}"
-        # Command to run juju show-offer --model <> <offer-url>
-        # so set the model
-        self._juju.model = _model
-        try:
-            self._juju.cli("show-offer", offer_url)
-            return True
-        except jubilant.CLIError as e:
-            if "not found" in e.stderr:
-                return False
-
-            raise JujuException(
-                f"Failed to check if offer {offer_url} exists: {str(e)}"
-            ) from e
-
     def consume_offer(self, model: str, offer_url: str, alias: str = ""):
         """Consume an offer.
 
@@ -1912,6 +1858,35 @@ class JujuStepHelper:
             return True
         except JujuSecretNotFound:
             return False
+
+    def find_subordinate_unit_for(
+        self, principal_unit: str, subordinate_app: str, model: str
+    ) -> str:
+        """Find subordinate unit for the given principal unit."""
+        status = self.jhelper.get_model_status(model)
+
+        principal_app = principal_unit.split("/")[0]
+        principal_app_status = status.apps.get(principal_app)
+        if not principal_app_status:
+            raise ApplicationNotFoundException(
+                f"Principal application {principal_app!r} not found in model {model!r}"
+            )
+
+        principal_unit_status = principal_app_status.units.get(principal_unit)
+        if not principal_unit_status:
+            raise UnitNotFoundException(
+                f"Principal unit {principal_unit!r} not found in model {model!r}"
+            )
+
+        subs = getattr(principal_unit_status, "subordinates", {}) or {}
+        for sub_name in subs.keys():
+            if sub_name.startswith(f"{subordinate_app}/"):
+                return sub_name
+
+        raise UnitNotFoundException(
+            f"Subordinate unit for {subordinate_app!r} not found for"
+            f"principal unit {principal_unit!r}"
+        )
 
 
 class JujuActionHelper:

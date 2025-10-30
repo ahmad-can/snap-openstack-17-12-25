@@ -68,7 +68,6 @@ from sunbeam.core.questions import (
     write_answers,
 )
 from sunbeam.core.steps import (
-    AddMachineUnitsStep,
     DeployMachineApplicationStep,
     DestroyMachineApplicationStep,
     RemoveMachineUnitsStep,
@@ -96,7 +95,7 @@ LOG = logging.getLogger(__name__)
 K8S_CONFIG_KEY = "TerraformVarsK8S"
 K8S_ADDONS_CONFIG_KEY = "TerraformVarsK8SAddons"
 APPLICATION = "k8s"
-K8S_APP_TIMEOUT = 300  # 5 minutes, managing the application should be fast
+K8S_APP_TIMEOUT = 1800  # 30 minutes, step includes adding / removing units
 K8S_DESTROY_TIMEOUT = 900
 K8S_UNIT_TIMEOUT = 1800  # 30 minutes, adding / removing units can take a long time
 K8S_ENABLE_ADDONS_TIMEOUT = 300  # 5 minutes
@@ -205,12 +204,13 @@ class DeployK8SApplicationStep(DeployMachineApplicationStep):
             K8S_CONFIG_KEY,
             APPLICATION,
             model,
+            [Role.CONTROL],
             "Deploy K8S",
             "Deploying K8S",
-            refresh,
         )
 
         self.accept_defaults = accept_defaults
+        self.refresh = refresh
         self.variables: dict = {}
         self.ranges: str | None = None
         self.traefik_variables: dict = {}
@@ -300,32 +300,6 @@ class DeployK8SApplicationStep(DeployMachineApplicationStep):
         return tfvars
 
 
-class AddK8SUnitsStep(AddMachineUnitsStep):
-    """Add K8S Unit."""
-
-    def __init__(
-        self,
-        client: Client,
-        names: list[str] | str,
-        jhelper: JujuHelper,
-        model: str,
-    ):
-        super().__init__(
-            client,
-            names,
-            jhelper,
-            K8S_CONFIG_KEY,
-            APPLICATION,
-            model,
-            "Add K8S unit",
-            "Adding K8S unit to machine",
-        )
-
-    def get_unit_timeout(self) -> int:
-        """Return unit timeout in seconds."""
-        return K8S_UNIT_TIMEOUT
-
-
 def _get_machines_space_ips(
     interfaces: dict[str, "jubilant.statustypes.NetworkInterface"],
     space: str,
@@ -408,18 +382,24 @@ class EnsureK8SUnitsTaggedStep(BaseStep):
         Raises K8SError if client not able to get nodes
         from k8s.
         """
+        LOG.debug(f"Matching K8S Node with name {hostname} and IPs {ips}")
+        hostname_without_domain = hostname.split(".")[0]
         k8s_nodes = list_nodes(
             self.kube, labels={DEPLOYMENT_LABEL: self.deployment.name}
         )
+        LOG.debug(f"K8S nodes filtered by deployment label: {k8s_nodes}")
 
         for k8s_node in k8s_nodes:
             if k8s_node.metadata is None:
                 LOG.debug("K8S node has no metadata, %s", k8s_node)
                 continue
 
-            if k8s_node.metadata.name == hostname:
+            # Check for hostname with and without fqdn
+            if k8s_node.metadata.name in [hostname, hostname_without_domain]:
                 return k8s_node
 
+            # Label should be always what is present in sunbeamd, so just
+            # use hostname to filter
             if (
                 k8s_node.metadata.labels
                 and k8s_node.metadata.labels.get(HOSTNAME_LABEL) == hostname
@@ -429,13 +409,14 @@ class EnsureK8SUnitsTaggedStep(BaseStep):
             if k8s_node.status is None or k8s_node.status.addresses is None:
                 LOG.debug("K8S node has no status nor addresses, %s", k8s_node)
                 continue
+
             for ip in ips:
                 for address in k8s_node.status.addresses:
                     if address.type == "InternalIP":
                         if address.address == ip:
                             return k8s_node
                     if address.type == "Hostname":
-                        if address.address == hostname:
+                        if address.address in [hostname, hostname_without_domain]:
                             return k8s_node
 
         raise ValueError("No K8s node matched")

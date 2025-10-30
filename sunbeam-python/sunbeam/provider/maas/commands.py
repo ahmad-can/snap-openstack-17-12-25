@@ -22,6 +22,7 @@ from sunbeam.commands.configure import (
     DemoSetup,
     TerraformDemoInitStep,
     UserOpenRCStep,
+    get_external_network_configs,
     retrieve_admin_credentials,
 )
 from sunbeam.commands.dashboard_url import retrieve_dashboard_url
@@ -88,6 +89,7 @@ from sunbeam.provider.maas.steps import (
     MaasConfigDPDKStep,
     MaasConfigSRIOVStep,
     MaasConfigureMicrocephOSDStep,
+    MaasConfigureOpenstackNetworkAgentsStep,
     MaasCreateLoadBalancerIPPoolsStep,
     MaasDeployInfraMachinesStep,
     MaasDeployK8SApplicationStep,
@@ -113,7 +115,6 @@ from sunbeam.steps.bootstrap_state import SetBootstrapped
 from sunbeam.steps.certificates import APPLICATION as CERTIFICATES_APPLICATION
 from sunbeam.steps.certificates import DeployCertificatesProviderApplicationStep
 from sunbeam.steps.cinder_volume import (
-    AddCinderVolumeUnitsStep,
     CheckCinderVolumeDistributionStep,
     DeployCinderVolumeApplicationStep,
     DestroyCinderVolumeApplicationStep,
@@ -125,7 +126,6 @@ from sunbeam.steps.clusterd import (
 )
 from sunbeam.steps.features import DisableEnabledFeatures
 from sunbeam.steps.hypervisor import (
-    AddHypervisorUnitsStep,
     DeployHypervisorApplicationStep,
     DestroyHypervisorApplicationStep,
     ReapplyHypervisorTerraformPlanStep,
@@ -146,7 +146,6 @@ from sunbeam.steps.juju import (
 )
 from sunbeam.steps.k8s import (
     AddK8SCloudStep,
-    AddK8SUnitsStep,
     CheckMysqlK8SDistributionStep,
     CheckOvnK8SDistributionStep,
     CheckRabbitmqK8SDistributionStep,
@@ -163,12 +162,15 @@ from sunbeam.steps.k8s import (
     UpdateK8SCloudStep,
 )
 from sunbeam.steps.microceph import (
-    AddMicrocephUnitsStep,
     CheckMicrocephDistributionStep,
     DeployMicrocephApplicationStep,
     DestroyMicrocephApplicationStep,
     RemoveMicrocephUnitsStep,
     SetCephMgrPoolSizeStep,
+)
+from sunbeam.steps.microovn import (
+    DeployMicroOVNApplicationStep,
+    ReapplyMicroOVNOptionalIntegrationsStep,
 )
 from sunbeam.steps.openstack import (
     DeployControlPlaneStep,
@@ -185,7 +187,6 @@ from sunbeam.steps.sso import (
     ValidateIdentityManifest,
 )
 from sunbeam.steps.sunbeam_machine import (
-    AddSunbeamMachineUnitsStep,
     DeploySunbeamMachineApplicationStep,
     DestroySunbeamMachineApplicationStep,
     RemoveSunbeamMachineUnitsStep,
@@ -587,6 +588,7 @@ def deploy(
     tfhelper_cinder_volume = deployment.get_tfhelper("cinder-volume-plan")
     tfhelper_openstack_deploy = deployment.get_tfhelper("openstack-plan")
     tfhelper_hypervisor_deploy = deployment.get_tfhelper("hypervisor-plan")
+    tfhelper_microovn = deployment.get_tfhelper("microovn-plan")
 
     plan: list[BaseStep] = []
     plan.append(AddManifestStep(client, manifest_path))
@@ -645,13 +647,7 @@ def deploy(
             jhelper,
             manifest,
             deployment.openstack_machines_model,
-            refresh=True,
             proxy_settings=proxy_settings,
-        )
-    )
-    plan2.append(
-        AddSunbeamMachineUnitsStep(
-            client, workers, jhelper, deployment.openstack_machines_model
         )
     )
     plan2.append(TerraformInitStep(tfhelper_k8s))
@@ -666,9 +662,6 @@ def deploy(
             deployment.openstack_machines_model,
             accept_defaults,
         )
-    )
-    plan2.append(
-        AddK8SUnitsStep(client, control, jhelper, deployment.openstack_machines_model)
     )
     plan2.append(
         StoreK8SKubeConfigStep(
@@ -717,11 +710,6 @@ def deploy(
         )
     )
     plan2.append(
-        AddMicrocephUnitsStep(
-            client, storage, jhelper, deployment.openstack_machines_model
-        )
-    )
-    plan2.append(
         MaasConfigureMicrocephOSDStep(
             client,
             maas_client,
@@ -742,15 +730,6 @@ def deploy(
         )
     )
     plan2.append(TerraformInitStep(tfhelper_openstack_deploy))
-    plan2.append(
-        AddCinderVolumeUnitsStep(
-            client,
-            storage,
-            jhelper,
-            deployment.openstack_machines_model,
-            tfhelper_openstack_deploy,
-        )
-    )
     plan2.append(
         MaasEndpointsConfigurationStep(
             deployment,
@@ -787,6 +766,32 @@ def deploy(
             manifest,
         )
     )
+    # Deploy MicroOVN and subordinate openstack-network-agents on network nodes
+    network_nodes = list(
+        map(_name_mapper, client.cluster.list_nodes_by_role(RoleTags.NETWORK.value))
+    )
+    if len(network_nodes) > 0:
+        plan2.append(TerraformInitStep(tfhelper_microovn))
+        plan2.append(
+            DeployMicroOVNApplicationStep(
+                deployment,
+                client,
+                tfhelper_microovn,
+                jhelper,
+                manifest,
+                deployment.openstack_machines_model,
+            )
+        )
+        plan2.append(
+            ReapplyMicroOVNOptionalIntegrationsStep(
+                deployment,
+                client,
+                tfhelper_microovn,
+                jhelper,
+                manifest,
+                deployment.openstack_machines_model,
+            )
+        )
     plan2.append(
         OpenStackPatchLoadBalancerServicesIPPoolStep(
             client, deployment.public_api_label
@@ -803,7 +808,6 @@ def deploy(
             jhelper,
             manifest,
             deployment.openstack_machines_model,
-            refresh=True,
         )
     )
     # Fill AMQP / Keystone / MySQL offers from openstack model
@@ -815,7 +819,6 @@ def deploy(
             jhelper,
             manifest,
             deployment.openstack_machines_model,
-            refresh=True,
         )
     )
     plan2.append(OpenStackPatchLoadBalancerServicesIPStep(client))
@@ -830,11 +833,6 @@ def deploy(
             jhelper,
             manifest,
             deployment.openstack_machines_model,
-        )
-    )
-    plan2.append(
-        AddHypervisorUnitsStep(
-            client, compute, jhelper, deployment.openstack_machines_model
         )
     )
 
@@ -937,6 +935,9 @@ def configure_cmd(
     compute = list(
         map(_name_mapper, client.cluster.list_nodes_by_role(RoleTags.COMPUTE.value))
     )
+    network = list(
+        map(_name_mapper, client.cluster.list_nodes_by_role(RoleTags.NETWORK.value))
+    )
     plan = [
         AddManifestStep(client, manifest_path),
         JujuLoginStep(deployment.juju_account),
@@ -975,6 +976,20 @@ def configure_cmd(
             jhelper,
             deployment.openstack_machines_model,
             manifest,
+        ),
+        # Configure network agents on network nodes using MAAS NIC tags
+        MaasConfigureOpenstackNetworkAgentsStep(
+            client,
+            maas_client,
+            network,
+            jhelper,
+            deployment.openstack_machines_model,
+            bridge_name=get_external_network_configs(client).get(
+                "external-bridge", "br-ex"
+            ),
+            physnet_name=get_external_network_configs(client).get(
+                "physnet-name", "physnet1"
+            ),
         ),
     ]
 
