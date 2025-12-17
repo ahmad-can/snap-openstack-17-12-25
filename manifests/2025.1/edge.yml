@@ -3,6 +3,8 @@ core:
     charms:
       cinder-volume:
         channel: 2025.1/edge
+        config:
+          snap-channel: 2025.1/edge
       cinder-volume-ceph:
         channel: 2025.1/edge
       cinder-k8s:
@@ -39,10 +41,24 @@ core:
         channel: squid/stable
         config:
           snap-channel: squid/stable
-      traefik-k8s:
-        channel: latest/stable
-        revision: 236
+      microovn:
+        channel: 25.03/stable
+      openstack-network-agents:
+        channel: 2025.1/edge
+        config:
+          snap-channel: 2025.1/edge
+      microcluster-token-distributor:
+        channel: latest/edge
 features:
+  baremetal:
+    software:
+      charms:
+        ironic-conductor-k8s:
+          channel: 2025.1/edge
+        ironic-k8s:
+          channel: 2025.1/edge
+        nova-ironic-k8s:
+          channel: 2025.1/edge
   caas:
     software:
       charms:

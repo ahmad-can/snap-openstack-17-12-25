@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -9,26 +9,6 @@ from sunbeam.core.common import ResultType
 from sunbeam.core.deployment import Networks
 from sunbeam.core.terraform import TerraformException
 from sunbeam.features.instance_recovery import consul as consul_feature
-
-
-@pytest.fixture()
-def tfhelper():
-    yield Mock()
-
-
-@pytest.fixture()
-def jhelper():
-    yield Mock()
-
-
-@pytest.fixture()
-def deployment():
-    yield Mock()
-
-
-@pytest.fixture()
-def manifest():
-    yield MagicMock()
 
 
 @pytest.fixture()
@@ -44,7 +24,170 @@ def update_config():
 
 
 class TestDeployConsulClientStep:
-    def test_run(self, deployment, tfhelper, jhelper, consulfeature):
+    def test_get_enable_tcp_check_options_with_storage(
+        self, deployment, tfhelper, jhelper, manifest
+    ):
+        """Test TCP check option when storage network exists."""
+        clients_to_enable = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: True,
+            consul_feature.ConsulServerNetworks.STORAGE: True,
+        }
+
+        result = consul_feature.ConsulFeature.health_checks_to_enable(clients_to_enable)
+
+        assert result[consul_feature.ConsulServerNetworks.MANAGEMENT] is False
+        assert result[consul_feature.ConsulServerNetworks.TENANT] is False
+        assert result[consul_feature.ConsulServerNetworks.STORAGE] is True
+
+    def test_get_enable_tcp_check_options_without_storage(
+        self, deployment, tfhelper, jhelper, manifest
+    ):
+        """Test TCP check option when storage network doesn't exist."""
+        clients_to_enable = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: True,
+            consul_feature.ConsulServerNetworks.STORAGE: False,
+        }
+
+        result = consul_feature.ConsulFeature.health_checks_to_enable(clients_to_enable)
+
+        assert result[consul_feature.ConsulServerNetworks.MANAGEMENT] is True
+        assert result[consul_feature.ConsulServerNetworks.TENANT] is False
+        assert result[consul_feature.ConsulServerNetworks.STORAGE] is False
+
+    def test_get_enable_tcp_check_options_with_only_management(
+        self, deployment, tfhelper, jhelper, manifest
+    ):
+        """Test TCP check option when storage network doesn't exist."""
+        clients_to_enable = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: False,
+            consul_feature.ConsulServerNetworks.STORAGE: False,
+        }
+
+        result = consul_feature.ConsulFeature.health_checks_to_enable(clients_to_enable)
+
+        assert result[consul_feature.ConsulServerNetworks.MANAGEMENT] is True
+        assert result[consul_feature.ConsulServerNetworks.TENANT] is False
+        assert result[consul_feature.ConsulServerNetworks.STORAGE] is False
+
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.consul_servers_to_enable"
+    )
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.get_config_from_manifest"
+    )
+    def test_get_tfvars_with_tcp_check_defaults(
+        self,
+        mock_get_config,
+        mock_servers_to_enable,
+        deployment,
+        tfhelper,
+        jhelper,
+        manifest,
+    ):
+        """Test that TCP health check is set by default when not in manifest."""
+        mock_servers_to_enable.return_value = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: False,
+            consul_feature.ConsulServerNetworks.STORAGE: True,
+        }
+        mock_get_config.return_value = {}
+
+        step = consul_feature.DeployConsulClientStep(
+            deployment, tfhelper, tfhelper, jhelper, manifest
+        )
+
+        result = step._get_tfvars()
+
+        # Management should be False, Storage should be True
+        assert (
+            result["consul-config-map"]["consul-management"]["enable-health-check"]
+            is False
+        )
+        assert (
+            result["consul-config-map"]["consul-storage"]["enable-health-check"] is True
+        )
+
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.consul_servers_to_enable"
+    )
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.get_config_from_manifest"
+    )
+    def test_get_tfvars_with_manifest_override(
+        self,
+        mock_get_config,
+        mock_servers_to_enable,
+        deployment,
+        tfhelper,
+        jhelper,
+        manifest,
+    ):
+        """Test that manifest config overrides default TCP health check setting."""
+        mock_servers_to_enable.return_value = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: False,
+            consul_feature.ConsulServerNetworks.STORAGE: False,
+        }
+        # Manifest explicitly sets enable-health-check
+        mock_get_config.return_value = {"enable-health-check": False}
+
+        step = consul_feature.DeployConsulClientStep(
+            deployment, tfhelper, tfhelper, jhelper, manifest
+        )
+
+        result = step._get_tfvars()
+
+        # Should respect manifest value (False) instead of default (True)
+        assert (
+            result["consul-config-map"]["consul-management"]["enable-health-check"]
+            is False
+        )
+
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.consul_servers_to_enable"
+    )
+    @patch(
+        "sunbeam.features.instance_recovery.consul.ConsulFeature.get_config_from_manifest"
+    )
+    def test_get_tfvars_all_networks_enabled(
+        self,
+        mock_get_config,
+        mock_servers_to_enable,
+        deployment,
+        tfhelper,
+        jhelper,
+        manifest,
+    ):
+        """Test TCP health check settings when all networks are enabled."""
+        mock_servers_to_enable.return_value = {
+            consul_feature.ConsulServerNetworks.MANAGEMENT: True,
+            consul_feature.ConsulServerNetworks.TENANT: True,
+            consul_feature.ConsulServerNetworks.STORAGE: True,
+        }
+        mock_get_config.return_value = {}
+
+        step = consul_feature.DeployConsulClientStep(
+            deployment, tfhelper, tfhelper, jhelper, manifest
+        )
+
+        result = step._get_tfvars()
+
+        # Only storage should have TCP check enabled
+        assert (
+            result["consul-config-map"]["consul-management"]["enable-health-check"]
+            is False
+        )
+        assert (
+            result["consul-config-map"]["consul-tenant"]["enable-health-check"] is False
+        )
+        assert (
+            result["consul-config-map"]["consul-storage"]["enable-health-check"] is True
+        )
+
+    def test_run(self, deployment, tfhelper, jhelper, consulfeature, manifest):
         step = consul_feature.DeployConsulClientStep(
             deployment, tfhelper, tfhelper, jhelper, manifest
         )
@@ -54,7 +197,9 @@ class TestDeployConsulClientStep:
         jhelper.wait_until_desired_status.assert_called_once()
         assert result.result_type == ResultType.COMPLETED
 
-    def test_run_tf_apply_failed(self, deployment, tfhelper, jhelper, consulfeature):
+    def test_run_tf_apply_failed(
+        self, deployment, tfhelper, jhelper, consulfeature, manifest
+    ):
         tfhelper.update_tfvars_and_apply_tf.side_effect = TerraformException(
             "apply failed..."
         )
@@ -68,7 +213,9 @@ class TestDeployConsulClientStep:
         assert result.result_type == ResultType.FAILED
         assert result.message == "apply failed..."
 
-    def test_run_waiting_timed_out(self, deployment, tfhelper, jhelper, consulfeature):
+    def test_run_waiting_timed_out(
+        self, deployment, tfhelper, jhelper, consulfeature, manifest
+    ):
         jhelper.wait_until_desired_status.side_effect = TimeoutError("timed out")
 
         step = consul_feature.DeployConsulClientStep(

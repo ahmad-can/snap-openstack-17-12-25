@@ -30,13 +30,8 @@ import sunbeam.utils as sunbeam_utils
 from sunbeam.clusterd.client import Client
 from sunbeam.clusterd.service import NodeNotExistInClusterException
 from sunbeam.commands.configure import (
-    CLOUD_CONFIG_SECTION,
     PCI_CONFIG_SECTION,
-    VARIABLE_DEFAULTS,
     BaseConfigDPDKStep,
-    ConfigureOpenStackNetworkAgentsLocalSettingsStep,
-    SetHypervisorUnitsOptionsStep,
-    ext_net_questions,
 )
 from sunbeam.core.checks import Check, DiagnosticsCheck, DiagnosticsResult
 from sunbeam.core.common import (
@@ -65,6 +60,12 @@ from sunbeam.provider.common import nic_utils
 from sunbeam.steps import clusterd
 from sunbeam.steps.cluster_status import ClusterStatusStep
 from sunbeam.steps.clusterd import APPLICATION as CLUSTERD_APPLICATION
+from sunbeam.steps.configure import (
+    BaseUserQuestions,
+    OpenstackNetworkAgentsUnitGetterMixin,
+    PrincipalUnitGetterMixin,
+    SetExternalNetworkUnitsOptionsStep,
+)
 from sunbeam.steps.juju import (
     JUJU_CONTROLLER_CHARM,
     BootstrapJujuStep,
@@ -539,9 +540,11 @@ class MachineRequirementsCheck(DiagnosticsCheck):
 
     def run(self) -> DiagnosticsResult:
         """Check machine meets requirements."""
-        if [maas_deployment.RoleTags.JUJU_CONTROLLER.value] == self.machine[
-            "roles"
-        ] or [maas_deployment.RoleTags.SUNBEAM.value] == self.machine["roles"]:
+        ctrl_roles = [
+            maas_deployment.RoleTags.JUJU_CONTROLLER.value,
+            maas_deployment.RoleTags.SUNBEAM.value,
+        ]
+        if len(self.machine["roles"]) == 1 and self.machine["roles"][0] in ctrl_roles:
             memory_min = RAM_4_GB_IN_MB
             core_min = 2
         else:
@@ -629,7 +632,12 @@ class DeploymentRolesCheck(DiagnosticsCheck):
     """Check deployment as enough nodes with given role."""
 
     def __init__(
-        self, machines: list[dict], role_name: str, role_tag: str, min_count: int = 3
+        self,
+        machines: list[dict],
+        role_name: str,
+        role_tag: str,
+        min_count: int = 3,
+        max_count: int | None = None,
     ):
         super().__init__(
             "Minimum role check",
@@ -639,6 +647,7 @@ class DeploymentRolesCheck(DiagnosticsCheck):
         self.role_name = role_name
         self.role_tag = role_tag
         self.min_count = min_count
+        self.max_count = max_count
 
     def run(self) -> DiagnosticsResult:
         """Checks if there's enough machines with given role."""
@@ -654,7 +663,7 @@ class DeploymentRolesCheck(DiagnosticsCheck):
             More on using tags: https://maas.io/docs/how-to-use-machine-tags
             """
         )
-        if machines == 0:
+        if machines == 0 and self.min_count > 0:
             return DiagnosticsResult.fail(
                 self.name,
                 "no machine with role: " + self.role_name,
@@ -673,6 +682,13 @@ class DeploymentRolesCheck(DiagnosticsCheck):
                     role_name=self.role_name,
                     role_tag=self.role_tag,
                 ),
+            )
+        if self.max_count is not None and machines > self.max_count:
+            return DiagnosticsResult.fail(
+                self.name,
+                f"{self.role_tag} not allowed",
+                "This type of deployment is not allowed to have "
+                f"{self.role_tag} nodes.",
             )
         return DiagnosticsResult.success(
             self.name,
@@ -883,6 +899,12 @@ class DeploymentTopologyCheck(DiagnosticsCheck):
         )
         self.machines = machines
 
+    def _has_region_controllers(self):
+        for machine in self.machines:
+            if maas_deployment.RoleTags.REGION_CONTROLLER.value in machine["roles"]:
+                return True
+        return False
+
     def run(self) -> list[DiagnosticsResult]:
         """Run a sequence of checks to validate deployment topology."""
         if len(self.machines) < 2:
@@ -894,6 +916,12 @@ class DeploymentTopologyCheck(DiagnosticsCheck):
                     " to be a part of an openstack deployment.",
                 )
             ]
+
+        has_region_controllers = self._has_region_controllers()
+        # A deployment that contains a region controller is not allowed to contain
+        # other roles such as control, storage or network.
+        # However, regular deployments can also act as primary regions.
+
         machines_by_zone = maas_client._group_machines_by_zone(self.machines)
         checks: list[DiagnosticsCheck] = []
         if JujuStepHelper().get_external_controllers():
@@ -918,17 +946,29 @@ class DeploymentTopologyCheck(DiagnosticsCheck):
         )
         checks.append(
             DeploymentRolesCheck(
-                self.machines, "control nodes", maas_deployment.RoleTags.CONTROL.value
+                self.machines,
+                "control nodes",
+                maas_deployment.RoleTags.CONTROL.value,
+                min_count=(0 if has_region_controllers else 3),
+                max_count=(0 if has_region_controllers else None),
             )
         )
         checks.append(
             DeploymentRolesCheck(
-                self.machines, "compute nodes", maas_deployment.RoleTags.COMPUTE.value
+                self.machines,
+                "compute nodes",
+                maas_deployment.RoleTags.COMPUTE.value,
+                min_count=(0 if has_region_controllers else 3),
+                max_count=(0 if has_region_controllers else None),
             )
         )
         checks.append(
             DeploymentRolesCheck(
-                self.machines, "storage nodes", maas_deployment.RoleTags.STORAGE.value
+                self.machines,
+                "storage nodes",
+                maas_deployment.RoleTags.STORAGE.value,
+                min_count=(0 if has_region_controllers else 3),
+                max_count=(0 if has_region_controllers else None),
             )
         )
         checks.append(ZonesCheck(list(machines_by_zone.keys())))
@@ -1160,6 +1200,12 @@ class MaasScaleJujuStep(ScaleJujuStep):
         machines = maas_client.list_machines(
             self.client, tags=maas_deployment.RoleTags.JUJU_CONTROLLER.value
         )
+        try:
+            machines += maas_client.list_machines(
+                self.client, tags=maas_deployment.RoleTags.REGION_CONTROLLER.value
+            )
+        except ValueError:
+            LOG.debug("No machines with region controller tag found")
 
         if len(machines) < self.n:
             LOG.debug(
@@ -1350,6 +1396,7 @@ class MaasAddMachinesToClusterdStep(BaseStep):
                     maas_deployment.RoleTags.COMPUTE.value,
                     maas_deployment.RoleTags.STORAGE.value,
                     maas_deployment.RoleTags.NETWORK.value,
+                    maas_deployment.RoleTags.REGION_CONTROLLER.value,
                 }
             ):
                 filtered_machines.append(machine)
@@ -1869,8 +1916,8 @@ class MaasDeployK8SApplicationStep(k8s.DeployK8SApplicationStep):
         return super().is_skip(status)
 
 
-class MaasSetHypervisorUnitsOptionsStep(SetHypervisorUnitsOptionsStep):
-    """Configure hypervisor settings on the machines."""
+class MaasSetExternalNetworkUnitsOptionsStep(SetExternalNetworkUnitsOptionsStep):
+    """Configure external network settings on the machines."""
 
     def __init__(
         self,
@@ -1887,130 +1934,101 @@ class MaasSetHypervisorUnitsOptionsStep(SetHypervisorUnitsOptionsStep):
             jhelper,
             model,
             manifest,
-            "Apply hypervisor settings",
-            "Applying hypervisor settings",
         )
         self.maas_client = maas_client
 
-    def _get_maas_nics(self) -> dict[str, str | None]:
-        """Retrieve fist nic from MAAS per machine with compute tag.
+    def has_prompts(self) -> bool:
+        """Returns true if the step has prompts that it can ask the user.
+
+        :return: True if the step can ask the user for prompts,
+                 False otherwise
+        """
+        return False
+
+    def _get_maas_bridge_mappings(self) -> dict[str, str | None]:
+        """Retrieve bridge mappings from MAAS per machine.
 
         Return a dict of format:
             {
-                "<machine>": "<nic1_name>" | None
+                "<machine>": "<bridge_mapping>" | None
             }
         """
         machines = maas_client.list_machines(self.maas_client, hostname=self.names)
-        nics = {}
+        bridge_mappings: dict[str, str | None] = {}
         for machine in machines:
-            machine_nics = [
-                nic["name"]
-                for nic in machine["nics"]
-                if maas_deployment.NicTags.COMPUTE.value in nic["tags"]
-            ]
+            nic_to_physnet_map: dict[str, str] = {}
+            for nic in machine["nics"]:
+                for tag in nic["tags"]:
+                    if tag.startswith("neutron:"):
+                        physnet = tag.split("neutron:")[1]
+                        device = typing.cast(str, nic["name"])
+                        if device in nic_to_physnet_map:
+                            LOG.warning(
+                                "Device %r already mapped to physnet %r,"
+                                " skipping for physnet %r",
+                                device,
+                                physnet,
+                                nic_to_physnet_map[device],
+                            )
+                            continue
+                        nic_to_physnet_map[nic["name"]] = physnet
 
-            if len(machine_nics) > 0:
-                # take first nic with compute tag
-                nic = machine_nics[0]
+            hostname = typing.cast(str, machine["hostname"])
+            if nic_to_physnet_map:
+                bridge_mappings[hostname] = self._build_bridge_mapping(
+                    [
+                        (physnet, device)
+                        for device, physnet in nic_to_physnet_map.items()
+                    ]
+                )
             else:
-                nic = None
-            nics[machine["hostname"]] = nic
-
-        return nics
+                bridge_mappings[hostname] = None
+        return bridge_mappings
 
     def is_skip(self, status: Status | None = None):
         """Determines if the step should be skipped or not."""
         result = super().is_skip(status)
         if result.result_type == ResultType.FAILED:
             return result
-        nics = self._get_maas_nics()
-        LOG.debug("Nics: %r", nics)
+        # Skip if no network nodes to configure
+        if not self.names:
+            return Result(ResultType.SKIPPED, "No network nodes to configure.")
+        bridge_mappings = self._get_maas_bridge_mappings()
+        LOG.debug("Bridge mappings: %r", bridge_mappings)
 
-        for machine, nic in nics.items():
+        for machine, nic in bridge_mappings.items():
             if nic is None:
-                nic_tag = maas_deployment.NicTags.COMPUTE.value
+                nic_tag = "neutron:*"
                 return Result(
                     ResultType.FAILED,
                     f"Machine {machine} does not have any {nic_tag} nic defined.",
                 )
 
-        self.nics = nics
+        self.bridge_mappings = bridge_mappings
         return Result(ResultType.COMPLETED)
 
 
-class MaasConfigureOpenstackNetworkAgentsStep(
-    ConfigureOpenStackNetworkAgentsLocalSettingsStep
+class MaasSetHypervisorUnitsOptionsStep(
+    MaasSetExternalNetworkUnitsOptionsStep, PrincipalUnitGetterMixin
+):
+    """Configure hypervisor settings on the machines."""
+
+    APP = "openstack-hypervisor"
+    DISPLAY_NAME = "hypervisor"
+    ACTION = "set-hypervisor-local-settings"
+
+
+class MaasSetOpenStackNetworkAgentsStep(
+    MaasSetExternalNetworkUnitsOptionsStep, OpenstackNetworkAgentsUnitGetterMixin
 ):
     """Configure OpenStack network agents settings on the machine."""
 
-    def __init__(
-        self,
-        client: Client,
-        maas_client: maas_client.MaasClient,
-        names: list[str],
-        jhelper: JujuHelper,
-        model: str,
-        bridge_name: str,
-        physnet_name: str,
-        enable_chassis_as_gw: bool = True,
-    ):
-        super().__init__(
-            client=client,
-            names=names,
-            jhelper=jhelper,
-            bridge_name=bridge_name,
-            physnet_name=physnet_name,
-            model=model,
-            enable_chassis_as_gw=enable_chassis_as_gw,
-        )
-        self.maas_client = maas_client
-
-    def _get_maas_nics(self) -> dict[str, str | None]:
-        """Retrieve first nic from MAAS per machine with network tag.
-
-        Return a dict of format:
-            {
-                "<machine>": "<nic1_name>" | None
-            }
-        """
-        machines = maas_client.list_machines(self.maas_client, hostname=self.names)
-        nics = {}
-        for machine in machines:
-            machine_nics = [
-                nic["name"]
-                for nic in machine["nics"]
-                if maas_deployment.NicTags.COMPUTE.value in nic["tags"]
-            ]
-
-            if len(machine_nics) > 0:
-                nic = machine_nics[0]
-            else:
-                nic = None
-            nics[machine["hostname"]] = nic
-
-        return nics
-
-    def is_skip(self, status: Status | None = None):
-        """Determines if the step should be skipped or not."""
-        result = super().is_skip(status)
-        if result.result_type == ResultType.FAILED:
-            return result
-        nics = self._get_maas_nics()
-        LOG.debug("Nics: %r", nics)
-
-        for machine, nic in nics.items():
-            if nic is None:
-                nic_tag = maas_deployment.NicTags.COMPUTE.value
-                return Result(
-                    ResultType.FAILED,
-                    f"Machine {machine} does not have any {nic_tag} nic defined.",
-                )
-
-        self.external_interfaces = nics
-        return Result(ResultType.COMPLETED)
+    APP = "openstack-network-agents"
+    DISPLAY_NAME = "network agents"
+    ACTION = "set-network-agents-local-settings"
 
 
-class MaasUserQuestions(BaseStep):
+class MaasUserQuestions(BaseUserQuestions):
     """Ask user configuration questions."""
 
     def __init__(
@@ -2020,40 +2038,16 @@ class MaasUserQuestions(BaseStep):
         manifest: Manifest | None = None,
         accept_defaults: bool = False,
     ):
-        super().__init__(
-            "Collect cloud configuration", "Collecting cloud configuration"
-        )
-        self.client = client
+        super().__init__(client, manifest, accept_defaults)
         self.maas_client = maas_client
-        self.accept_defaults = accept_defaults
-        self.manifest = manifest
 
-    def has_prompts(self) -> bool:
-        """Returns true if the step has prompts that it can ask the user."""
-        return True
-
-    def prompt(
+    def _get_question_bank(
         self,
-        console: Console | None = None,
-        show_hint: bool = False,
-    ) -> None:
-        """Prompt the user for basic cloud configuration.
-
-        Prompts the user for required information for cloud configuration.
-
-        :param console: the console to prompt on
-        :type console: rich.console.Console (Optional)
-        """
-        self.variables = sunbeam.core.questions.load_answers(
-            self.client, CLOUD_CONFIG_SECTION
-        )
-        for section in ["user", "external_network"]:
-            if not self.variables.get(section):
-                self.variables[section] = {}
-        preseed = {}
-        if self.manifest and (user := self.manifest.core.config.user):
-            preseed = user.model_dump(by_alias=True)
-        user_bank = sunbeam.core.questions.QuestionBank(
+        console: Console | None,
+        preseed: dict,
+        show_hint: bool,
+    ) -> sunbeam.core.questions.QuestionBank:
+        return sunbeam.core.questions.QuestionBank(
             questions=maas_deployment.maas_user_questions(self.maas_client),
             console=console,
             preseed=preseed,
@@ -2061,76 +2055,12 @@ class MaasUserQuestions(BaseStep):
             accept_defaults=self.accept_defaults,
             show_hint=show_hint,
         )
+
+    def _configure_remote_access(
+        self,
+        user_bank: sunbeam.core.questions.QuestionBank,
+    ) -> None:
         self.variables["user"]["remote_access_location"] = sunbeam_utils.REMOTE_ACCESS
-        # External Network Configuration
-        preseed = {}
-        if self.manifest and (
-            ext_network := self.manifest.core.config.external_network
-        ):
-            preseed = ext_network.model_dump(by_alias=True)
-        ext_net_bank = sunbeam.core.questions.QuestionBank(
-            questions=ext_net_questions(),
-            console=console,
-            preseed=preseed,
-            previous_answers=self.variables.get("external_network"),
-            accept_defaults=self.accept_defaults,
-            show_hint=show_hint,
-        )
-        self.variables["external_network"]["cidr"] = ext_net_bank.cidr.ask()
-        external_network = ipaddress.ip_network(
-            self.variables["external_network"]["cidr"]
-        )
-        external_network_hosts = list(external_network.hosts())
-        default_gateway = self.variables["external_network"].get("gateway") or str(
-            external_network_hosts[0]
-        )
-        self.variables["external_network"]["gateway"] = ext_net_bank.gateway.ask(
-            new_default=default_gateway
-        )
-
-        default_allocation_range = (
-            self.variables["external_network"].get("range")
-            or f"{external_network_hosts[1]}-{external_network_hosts[-1]}"
-        )
-        self.variables["external_network"]["range"] = ext_net_bank.range.ask(
-            new_default=default_allocation_range
-        )
-
-        self.variables["external_network"]["physical_network"] = VARIABLE_DEFAULTS[
-            "external_network"
-        ]["physical_network"]
-
-        self.variables["external_network"]["network_type"] = (
-            ext_net_bank.network_type.ask()
-        )
-        if self.variables["external_network"]["network_type"] == "vlan":
-            self.variables["external_network"]["segmentation_id"] = (
-                ext_net_bank.segmentation_id.ask()
-            )
-        else:
-            self.variables["external_network"]["segmentation_id"] = 0
-
-        self.variables["user"]["run_demo_setup"] = user_bank.run_demo_setup.ask()
-        if self.variables["user"]["run_demo_setup"]:
-            # User configuration
-            self.variables["user"]["username"] = user_bank.username.ask()
-            self.variables["user"]["password"] = user_bank.password.ask()
-            self.variables["user"]["cidr"] = user_bank.cidr.ask()
-            nameservers = user_bank.nameservers.ask()
-            self.variables["user"]["dns_nameservers"] = (
-                nameservers.split() if nameservers else []
-            )
-            self.variables["user"]["security_group_rules"] = (
-                user_bank.security_group_rules.ask()
-            )
-
-        sunbeam.core.questions.write_answers(
-            self.client, CLOUD_CONFIG_SECTION, self.variables
-        )
-
-    def run(self, status: Status | None = None) -> Result:
-        """Run the step to completion."""
-        return Result(ResultType.COMPLETED)
 
 
 class MaasClusterStatusStep(ClusterStatusStep):
@@ -2197,13 +2127,20 @@ class MaasCreateLoadBalancerIPPoolsStep(CreateLoadBalancerIPPoolsStep):
         return lb_range
 
     def ippools(self) -> dict[str, list[str]]:
-        """IPAddress pools.
+        """Return IP address pools for public and storage networks.
 
-        Pools should be in format of
-        {<pool name>: <List of ipaddresses>}
+        Returns IP pool definitions for public and storage networks.
+        Public network is required; if unavailable, no pools are created.
+        Storage network is optional.
+
+        Returns:
+        Dict mapping pool names to lists of IP address ranges.
+        Format: {<pool_name>: [<ip_ranges>]}
         """
         public_space = self.deployment.get_space(Networks.PUBLIC)
+        storage_space = self.deployment.get_space(Networks.STORAGE)
 
+        ippools: dict[str, list[str]] = {}
         try:
             public_ranges = maas_client.get_ip_ranges_from_space(
                 self.maas_client, public_space
@@ -2213,11 +2150,29 @@ class MaasCreateLoadBalancerIPPoolsStep(CreateLoadBalancerIPPoolsStep):
             LOG.debug("Failed to ip ranges for space: %r", public_space, exc_info=True)
             return {}
 
+        # Create metallb ipaddresspool for storage if the label exists in maas
+        try:
+            storage_ranges = maas_client.get_ip_ranges_from_space(
+                self.maas_client, storage_space
+            )
+            LOG.debug("Storage ip ranges: %r", storage_ranges)
+        except ValueError:
+            LOG.debug("Failed to ip ranges for space: %r", storage_space)
+            storage_ranges = {}
+
         public_metallb_range = self._to_range(  # noqa
             public_ranges, self.deployment.public_api_label
         )
+        ippools.update({self.deployment.public_ip_pool: public_metallb_range})
 
-        return {self.deployment.public_ip_pool: public_metallb_range}
+        if storage_ranges:
+            storage_metallb_range = self._to_range(
+                storage_ranges, self.deployment.storage_ippool_label
+            )
+            if storage_metallb_range:
+                ippools.update({self.deployment.storage_ip_pool: storage_metallb_range})
+
+        return ippools
 
 
 class MaasConfigSRIOVStep(BaseStep):

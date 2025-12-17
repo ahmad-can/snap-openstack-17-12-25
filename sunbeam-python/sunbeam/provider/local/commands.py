@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2024 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
+import json
 import logging
 from pathlib import Path
 from typing import Tuple, Type
@@ -22,8 +24,6 @@ from sunbeam.commands.configure import (
     DemoSetup,
     TerraformDemoInitStep,
     UserOpenRCStep,
-    UserQuestions,
-    get_external_network_configs,
     retrieve_admin_credentials,
 )
 from sunbeam.commands.dashboard_url import retrieve_dashboard_url
@@ -75,14 +75,16 @@ from sunbeam.core.openstack import OPENSTACK_MODEL
 from sunbeam.core.questions import get_stdin_reopen_tty
 from sunbeam.core.terraform import TerraformInitStep
 from sunbeam.provider.base import ProviderBase
+from sunbeam.provider.common.multiregion import connect_to_region_controller
 from sunbeam.provider.local.deployment import LOCAL_TYPE, LocalDeployment
 from sunbeam.provider.local.steps import (
     LocalClusterStatusStep,
     LocalConfigDPDKStep,
     LocalConfigSRIOVStep,
-    LocalConfigureOpenStackNetworkAgentsStep,
     LocalEndpointsConfigurationStep,
     LocalSetHypervisorUnitsOptionsStep,
+    LocalSetOpenStackNetworkAgentsStep,
+    LocalUserQuestions,
 )
 from sunbeam.steps import cluster_status
 from sunbeam.steps.bootstrap_state import SetBootstrapped
@@ -220,6 +222,7 @@ class LocalProvider(ProviderBase):
         configure.add_command(configure_dpdk)
         cluster.add_command(bootstrap)
         cluster.add_command(add)
+        cluster.add_command(add_secondary_region_node)
         cluster.add_command(join)
         cluster.add_command(list_nodes)
         cluster.add_command(remove)
@@ -577,9 +580,9 @@ def deploy_and_migrate_juju_controller(
     multiple=True,
     default=["control", "compute"],
     callback=validate_roles,
-    help="Specify additional roles, compute, storage or network, for the "
-    "bootstrap node. Defaults to the compute role."
-    " Can be repeated and comma separated.",
+    help="Specify additional roles for the bootstrap node. "
+    "Possible values: compute, storage, network, region_controller. "
+    "Defaults to the compute role. Can be repeated and comma separated.",
 )
 @click_option_topology
 @click_option_database
@@ -590,9 +593,15 @@ def deploy_and_migrate_juju_controller(
     type=str,
     help="Juju controller name",
 )
+@click.option(
+    "--region-controller-token",
+    "region_controller_token",
+    help="Token obtained from the region controller.",
+    type=str,
+)
 @click_option_show_hints
 @click.pass_context
-def bootstrap(
+def bootstrap(  # noqa: C901
     ctx: click.Context,
     roles: list[Role],
     topology: str,
@@ -601,6 +610,7 @@ def bootstrap(
     manifest_path: Path | None = None,
     accept_defaults: bool = False,
     show_hints: bool = False,
+    region_controller_token: str | None = None,
 ) -> None:
     """Bootstrap the local node.
 
@@ -625,18 +635,24 @@ def bootstrap(
     LOG.debug(f"Manifest used for deployment - core: {manifest.core}")
     LOG.debug(f"Manifest used for deployment - features: {manifest.features}")
 
-    # Bootstrap node must always have the control role
-    if Role.CONTROL not in roles:
+    # Bootstrap node must always have the control role or region controller
+    # role.
+    if Role.CONTROL not in roles and Role.REGION_CONTROLLER not in roles:
         LOG.debug("Enabling control role for bootstrap")
         roles.append(Role.CONTROL)
     is_control_node = any(role.is_control_node() for role in roles)
     is_compute_node = any(role.is_compute_node() for role in roles)
     is_storage_node = any(role.is_storage_node() for role in roles)
     is_network_node = any(role.is_network_node() for role in roles)
+    is_region_controller = any(role.is_region_controller() for role in roles)
 
     if is_network_node and is_compute_node:
         raise click.ClickException(
             "A node cannot be both a compute and network node at the same time."
+        )
+    if is_region_controller and len(roles) > 1:
+        raise click.ClickException(
+            "The region controller role is mutually exclusive with all other roles."
         )
 
     fqdn = utils.get_fqdn()
@@ -697,6 +713,15 @@ def bootstrap(
             bool(juju_controller),
         )
     )
+    # We'll have to switch between the bootstrap controller and the
+    # region controller, if provided.
+    deployment_controller = (
+        deployment.juju_controller.name if deployment.juju_controller else None
+    )
+    bootstrap_controller = (
+        juju_controller or deployment_controller or "localhost-localhost"
+    )
+    plan.append(SwitchToController(bootstrap_controller))
     plan.append(JujuLoginStep(deployment.juju_account))
     # bootstrapped node is always machine 0 in controller model
     plan.append(ClusterInitStep(client, roles_to_str_list(roles), 0, management_cidr))
@@ -711,6 +736,15 @@ def bootstrap(
     plan.append(PromptRegionStep(client, manifest, accept_defaults))
     plan.append(ValidateIdentityManifest(client, manifest))
     run_plan(plan, console, show_hints)
+
+    if region_controller_token:
+        connect_to_region_controller(
+            deployment,
+            region_controller_token,
+            bootstrap_controller,
+            show_hints=show_hints,
+        )
+        deployments.update_deployment(deployment)
 
     update_config(client, DEPLOYMENTS_CONFIG_KEY, deployments.get_minimal_info())
     proxy_settings = deployment.get_proxy_settings()
@@ -803,7 +837,7 @@ def bootstrap(
             )
         )
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         plan1.append(
             LocalEndpointsConfigurationStep(
                 client,
@@ -820,6 +854,7 @@ def bootstrap(
                 topology,
                 deployment.openstack_machines_model,
                 proxy_settings=proxy_settings,
+                is_region_controller=is_region_controller,
             )
         )
         plan1.append(
@@ -867,26 +902,28 @@ def bootstrap(
 
     plan2: list[BaseStep] = []
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         plan2.append(OpenStackPatchLoadBalancerServicesIPStep(client))
 
-    # NOTE(jamespage):
-    # As with MicroCeph, always deploy the openstack-hypervisor charm
-    # and add a unit to the bootstrap node if required.
-    hypervisor_tfhelper = deployment.get_tfhelper("hypervisor-plan")
-    plan2.append(TerraformInitStep(hypervisor_tfhelper))
-    plan2.append(
-        DeployHypervisorApplicationStep(
-            deployment,
-            client,
-            hypervisor_tfhelper,
-            openstack_tfhelper,
-            cinder_volume_tfhelper,
-            jhelper,
-            manifest,
-            deployment.openstack_machines_model,
+    if not is_region_controller:
+        # NOTE(jamespage):
+        # As with MicroCeph, always deploy the openstack-hypervisor charm
+        # and add a unit to the bootstrap node if required.
+        hypervisor_tfhelper = deployment.get_tfhelper("hypervisor-plan")
+        plan2.append(TerraformInitStep(hypervisor_tfhelper))
+        plan2.append(
+            DeployHypervisorApplicationStep(
+                deployment,
+                client,
+                hypervisor_tfhelper,
+                openstack_tfhelper,
+                cinder_volume_tfhelper,
+                jhelper,
+                manifest,
+                deployment.openstack_machines_model,
+            )
         )
-    )
+
     if is_network_node:
         microovn_tfhelper = deployment.get_tfhelper("microovn-plan")
         plan2.append(TerraformInitStep(microovn_tfhelper))
@@ -952,9 +989,10 @@ def configure_sriov(
         return
 
     manifest = deployment.get_manifest(manifest_path)
-    jhelper = JujuHelper(deployment.juju_controller)
+    jhelper = deployment.get_juju_helper()
+    jhelper_keystone = deployment.get_juju_helper(keystone=True)
 
-    admin_credentials = retrieve_admin_credentials(jhelper, OPENSTACK_MODEL)
+    admin_credentials = retrieve_admin_credentials(jhelper_keystone, OPENSTACK_MODEL)
     admin_credentials["OS_INSECURE"] = "true"
 
     tfhelper_hypervisor = deployment.get_tfhelper("hypervisor-plan")
@@ -1020,9 +1058,10 @@ def configure_dpdk(
         return
 
     manifest = deployment.get_manifest(manifest_path)
-    jhelper = JujuHelper(deployment.juju_controller)
+    jhelper = deployment.get_juju_helper()
+    jhelper_keystone = deployment.get_juju_helper(keystone=True)
 
-    admin_credentials = retrieve_admin_credentials(jhelper, OPENSTACK_MODEL)
+    admin_credentials = retrieve_admin_credentials(jhelper_keystone, OPENSTACK_MODEL)
     admin_credentials["OS_INSECURE"] = "true"
 
     tfhelper_hypervisor = deployment.get_tfhelper("hypervisor-plan")
@@ -1143,6 +1182,82 @@ def add(
 
 
 @click.command()
+@click.argument("name", type=str)
+@click.option(
+    "-f",
+    "--format",
+    type=click.Choice([FORMAT_DEFAULT, FORMAT_VALUE, FORMAT_YAML]),
+    default=FORMAT_DEFAULT,
+    help="Output format.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(
+        file_okay=True,
+        dir_okay=False,
+        writable=True,
+        resolve_path=True,
+        path_type=Path,
+    ),
+    help="Output file for join token.",
+)
+@click_option_show_hints
+@click.pass_context
+def add_secondary_region_node(
+    ctx: click.Context,
+    name: str,
+    format: str,
+    output: Path | None,
+    show_hints: bool,
+) -> None:
+    """Generate a token for a secondary region node.
+
+    NAME must be a fully qualified domain name.
+    """
+    preflight_checks = [DaemonGroupCheck(), VerifyFQDNCheck(name)]
+    run_preflight_checks(preflight_checks, console)
+    name = remove_trailing_dot(name)
+
+    deployment: LocalDeployment = ctx.obj
+    client = deployment.get_client()
+    jhelper = JujuHelper(deployment.juju_controller)
+
+    plan1: list[BaseStep] = [
+        JujuLoginStep(deployment.juju_account),
+        CreateJujuUserStep(name),
+        JujuGrantModelAccessStep(jhelper, name, deployment.openstack_machines_model),
+        JujuGrantModelAccessStep(jhelper, name, OPENSTACK_MODEL),
+    ]
+
+    plan1_results = run_plan(plan1, console, show_hints)
+
+    juju_registration_token = get_step_message(plan1_results, CreateJujuUserStep)
+
+    plan2 = [ClusterAddJujuUserStep(client, name, juju_registration_token)]
+    run_plan(plan2, console, show_hints)
+
+    deployment.reload_credentials()
+    # The controller information is normally obtained through clusterd, however
+    # ther other regions won't be part of the same cluster. As such,
+    # we'll include this information in the join token.
+    if not deployment.juju_controller:
+        raise click.ClickException("Missing Juju controller information.")
+    token_dict = {
+        "juju_registration_token": juju_registration_token,
+        "juju_controller": deployment.juju_controller.to_dict(),
+        "name": name,
+        "primary_region_name": deployment.get_region_name(),
+    }
+    token = base64.b64encode(json.dumps(token_dict).encode()).decode()
+
+    if output:
+        _write_to_file(token, output)
+    else:
+        _print_output(token, format, name)
+
+
+@click.command()
 @click.argument("token", type=str)
 @click.option("-a", "--accept-defaults", help="Accept all defaults.", is_flag=True)
 @click.option(
@@ -1157,14 +1272,21 @@ def add(
         " Can be repeated and comma separated."
     ),
 )
+@click.option(
+    "--region-controller-token",
+    "region_controller_token",
+    help="Token obtained from the region controller.",
+    type=str,
+)
 @click_option_show_hints
 @click.pass_context
-def join(
+def join(  # noqa: C901
     ctx: click.Context,
     token: str,
     roles: list[Role],
     accept_defaults: bool = False,
     show_hints: bool = False,
+    region_controller_token: str | None = None,
 ) -> None:
     """Join node to the cluster.
 
@@ -1177,10 +1299,15 @@ def join(
     is_compute_node = any(role.is_compute_node() for role in roles)
     is_storage_node = any(role.is_storage_node() for role in roles)
     is_network_node = any(role.is_network_node() for role in roles)
+    is_region_controller = any(role.is_region_controller() for role in roles)
 
     if is_network_node and is_compute_node:
         raise click.ClickException(
             "A node cannot be both a compute and network node at the same time."
+        )
+    if is_region_controller and len(roles) > 1:
+        raise click.ClickException(
+            "The region controller role is mutually exclusive with all other roles."
         )
 
     # Register juju user with same name as Node fqdn
@@ -1252,6 +1379,18 @@ def join(
     ]
     run_plan(plan2, console, show_hints)
 
+    if region_controller_token:
+        if not (deployment.juju_controller and deployment.juju_controller.name):
+            # We shouldn't reach this, the controller is validated
+            # through CheckJujuReachableStep.
+            raise ValueError("Missing Juju controller name.")
+        connect_to_region_controller(
+            deployment,
+            region_controller_token,
+            deployment.juju_controller.name,
+            show_hints=show_hints,
+        )
+
     # Loads juju account
     deployment.reload_credentials()
     deployments.write()
@@ -1290,7 +1429,7 @@ def join(
         )
     )
 
-    if is_control_node:
+    if is_control_node or is_region_controller:
         # accept_defaults True to pick from manifest saved ones??
         plan4.append(TerraformInitStep(k8s_tfhelper))
         plan4.append(
@@ -1354,6 +1493,16 @@ def join(
                 deployment.openstack_machines_model,
             )
         )
+        plan4.append(
+            LocalSetOpenStackNetworkAgentsStep(
+                client,
+                name,
+                jhelper,
+                deployment.openstack_machines_model,
+                join_mode=True,
+                manifest=manifest,
+            ),
+        )
 
     if is_storage_node:
         plan4.append(TerraformInitStep(microceph_tfhelper))
@@ -1400,6 +1549,7 @@ def join(
                     manifest,
                     "auto",
                     deployment.openstack_machines_model,
+                    is_region_controller=is_region_controller,
                 )
             )
 
@@ -1695,7 +1845,8 @@ def configure_cmd(
     LOG.debug(f"Manifest used for deployment - features: {manifest.features}")
 
     name = utils.get_fqdn(deployment.get_management_cidr())
-    jhelper = JujuHelper(deployment.juju_controller)
+    jhelper = deployment.get_juju_helper()
+    jhelper_keystone = deployment.get_juju_helper(keystone=True)
     if not jhelper.model_exists(OPENSTACK_MODEL):
         LOG.error(f"Expected model {OPENSTACK_MODEL} missing")
         raise click.ClickException("Please run `sunbeam cluster bootstrap` first")
@@ -1706,8 +1857,16 @@ def configure_cmd(
         AddManifestStep(client, manifest_path),
         JujuLoginStep(deployment.juju_account),
     ]
+    if deployment.region_ctrl_juju_controller:
+        plan.append(
+            JujuLoginStep(
+                deployment.region_ctrl_juju_account,
+                deployment.region_ctrl_juju_controller.name,
+            ),
+        )
 
-    admin_credentials = retrieve_admin_credentials(jhelper, OPENSTACK_MODEL)
+    admin_credentials = retrieve_admin_credentials(jhelper_keystone, OPENSTACK_MODEL)
+
     # Add OS_INSECURE as https not working with terraform openstack provider.
     admin_credentials["OS_INSECURE"] = "true"
     tfplan = "demo-setup"
@@ -1717,7 +1876,7 @@ def configure_cmd(
 
     plan.extend(
         [
-            UserQuestions(
+            LocalUserQuestions(
                 client,
                 answer_file=answer_file,
                 manifest=manifest,
@@ -1738,10 +1897,6 @@ def configure_cmd(
 
     if "compute" in node["role"]:
         tfhelper_hypervisor = deployment.get_tfhelper("hypervisor-plan")
-        machine_id = str(node.get("machineid"))
-        jhelper.get_unit_from_machine(
-            "openstack-hypervisor", machine_id, deployment.openstack_machines_model
-        )
         plan.append(
             LocalSetHypervisorUnitsOptionsStep(
                 client,
@@ -1766,27 +1921,21 @@ def configure_cmd(
         )
 
     if "network" in node["role"]:
-        # Get external network configuration from user answers
-        ext_net_config = get_external_network_configs(client)
-        bridge_name = ext_net_config.get("external-bridge", "br-ex")
-        physnet_name = ext_net_config.get("physnet-name", "physnet1")
-
         plan.append(
-            LocalConfigureOpenStackNetworkAgentsStep(
+            LocalSetOpenStackNetworkAgentsStep(
                 client,
                 name,
                 jhelper,
                 deployment.openstack_machines_model,
-                manifest,
-                accept_defaults,
-                bridge_name=bridge_name,
-                physnet_name=physnet_name,
-                enable_chassis_as_gw=True,
+                # Accept preseed file but do not allow 'accept_defaults' as nic
+                # selection may vary from machine to machine and is potentially
+                # destructive if it takes over an unintended nic.
+                manifest=manifest,
             )
         )
 
     run_plan(plan, console, show_hints)
-    dashboard_url = retrieve_dashboard_url(jhelper)
+    dashboard_url = retrieve_dashboard_url(jhelper_keystone)
     console.print("The cloud has been configured for sample usage.")
     console.print(
         "You can start using the OpenStack client"

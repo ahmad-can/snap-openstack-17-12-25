@@ -21,6 +21,7 @@ from snaphelpers import Snap, UnknownConfigKey
 from tenacity import RetryCallState
 
 from sunbeam.clusterd.client import Client
+from sunbeam.errors import SunbeamException  # noqa F401
 
 LOG = logging.getLogger(__name__)
 RAM_16_GB_IN_KB = 16 * 1000 * 1000
@@ -63,6 +64,7 @@ class Role(enum.Enum):
     COMPUTE = 2
     STORAGE = 3
     NETWORK = 4
+    REGION_CONTROLLER = 5
 
     def is_control_node(self) -> bool:
         """Returns True if the node requires control services.
@@ -111,6 +113,17 @@ class Role(enum.Enum):
                  False otherwise
         """
         return self == Role.NETWORK
+
+    def is_region_controller(self) -> bool:
+        """Returns True if the node is a region controller.
+
+        Region controllers are used in multi-region environments, running
+        services such as Keystone or Horizon.
+
+        :return: True if the node should have region controller services,
+                 False otherwise
+        """
+        return self == Role.REGION_CONTROLLER
 
 
 def roles_to_str_list(roles: list[Role]) -> list[str]:
@@ -516,12 +529,6 @@ def convert_proxy_to_model_configs(proxy_settings: dict) -> dict:
     }
 
 
-class SunbeamException(Exception):
-    """Base exception for sunbeam."""
-
-    pass
-
-
 class RiskLevel(str, enum.Enum):
     STABLE = "stable"
     CANDIDATE = "candidate"
@@ -651,3 +658,45 @@ def convert_retry_failure_as_result(retry_state: RetryCallState) -> Result:
         return Result(ResultType.FAILED, str(retry_state.outcome.exception()))
     else:
         return Result(ResultType.FAILED)
+
+
+def friendly_terraform_lock_retry_callback(retry_state: RetryCallState) -> Result:
+    """Friendly retry callback for Terraform state lock exceptions.
+
+    Shows user-friendly messages during lock retries
+    instead of verbose Terraform output.
+    """
+    from sunbeam.core.terraform import TerraformStateLockedException
+
+    if retry_state.outcome is not None:
+        exception = retry_state.outcome.exception()
+        if isinstance(exception, TerraformStateLockedException):
+            # Extract lock ID from the error message if possible
+            lock_id = "unknown"
+            error_str = str(exception)
+            if "ID:" in error_str:
+                try:
+                    # Extract lock ID from Terraform output
+                    lines = error_str.split("\n")
+                    for line in lines:
+                        if "ID:" in line:
+                            lock_id = line.split("ID:")[1].strip()
+                            break
+                except Exception:
+                    LOG.debug(
+                        "Failed to extract lock ID from Terraform output: %s",
+                        error_str,
+                    )
+                    pass
+
+            return Result(
+                ResultType.FAILED,
+                f"Terraform state is locked (ID: {lock_id}). "
+                f"This usually resolves automatically. "
+                f"If it persists, use 'sunbeam plans unlock <plan>' to "
+                f"clear stale locks.",
+            )
+        else:
+            return Result(ResultType.FAILED, str(exception))
+    else:
+        return Result(ResultType.FAILED, "Operation failed after retries")

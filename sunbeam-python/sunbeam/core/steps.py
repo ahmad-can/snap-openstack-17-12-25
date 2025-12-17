@@ -374,13 +374,42 @@ class PatchLoadBalancerServicesIPStep(BaseStep, abc.ABC):
     def __init__(
         self,
         client: Client,
+        pool_name: str | None = None,
+        # Ignore errors if service of type LoadBalancer is not found
+        ignore_errors: bool = False,
     ):
         super().__init__(
             "Patch LoadBalancer services",
             "Patch LoadBalancer service IP annotation",
         )
         self.client = client
+        self.pool_name = pool_name
+        self.ignore_errors = ignore_errors
         self.lb_ip_annotation = K8SHelper.get_loadbalancer_ip_annotation()
+
+    def _check_ippool_exists(self, kube_client: "l_client.Client") -> Result:
+        """Check if the specified IP pool exists.
+
+        :param kube_client: Kubernetes client instance
+        :return: Result with SKIPPED if pool doesn't exist, COMPLETED if it exists,
+                 or FAILED on error
+        """
+        if not self.pool_name:
+            return Result(ResultType.COMPLETED)
+
+        lbpool_resource = K8SHelper.get_lightkube_loadbalancer_resource()
+        lbpool_model = K8SHelper.get_loadbalancer_namespace()
+        try:
+            pools = kube_client.list(lbpool_resource, namespace=lbpool_model)
+            pool_names = [pool.metadata.name for pool in pools if pool.metadata]
+            if self.pool_name not in pool_names:
+                LOG.debug(f"IPAddresspool {self.pool_name} does not exist, skipping")
+                return Result(ResultType.SKIPPED)
+        except l_exceptions.ApiError as e:
+            LOG.debug("Error listing load balancer pools", exc_info=True)
+            return Result(ResultType.FAILED, str(e))
+
+        return Result(ResultType.COMPLETED)
 
     @abc.abstractmethod
     def services(self) -> list[str]:
@@ -428,11 +457,36 @@ class PatchLoadBalancerServicesIPStep(BaseStep, abc.ABC):
             LOG.debug("Error creating k8s client", exc_info=True)
             return Result(ResultType.FAILED, str(e))
 
+        # Skip if pool does not exist
+        pool_check_result = self._check_ippool_exists(self.kube)
+        if pool_check_result.result_type != ResultType.COMPLETED:
+            return pool_check_result
+
         for service_name in self.services():
             try:
                 service = self._get_service(service_name, find_lb=True)
             except l_exceptions.ApiError as e:
+                if self.ignore_errors and e.status.code == 404:
+                    message = (
+                        f"Service {service_name!r} of type LoadBalancer not found, "
+                        "skipping as ignore_errors is set"
+                    )
+                    LOG.debug(message)
+                    continue
                 return Result(ResultType.FAILED, str(e))
+
+            if (
+                self.ignore_errors
+                and service.spec
+                and service.spec.type != "LoadBalancer"
+            ):
+                message = (
+                    f"Service {service_name!r} is not of type LoadBalancer, skipping "
+                    "as ignore_errors is set"
+                )
+                LOG.debug(message)
+                continue
+
             if not service.metadata:
                 return Result(
                     ResultType.FAILED, f"k8s service {service_name!r} has no metadata"
@@ -479,8 +533,13 @@ class PatchLoadBalancerServicesIPStep(BaseStep, abc.ABC):
                 loadbalancer_ip = service.status.loadBalancer.ingress[0].ip
                 service_annotations[self.lb_ip_annotation] = loadbalancer_ip
                 service.metadata.annotations = service_annotations
-                LOG.debug(f"Patching {service_name!r} to use IP {loadbalancer_ip!r}")
-                self.kube.patch(core_v1.Service, service_name, obj=service)
+                LOG.debug(f"Updating {service_name!r} to use IP {loadbalancer_ip!r}")
+                # Some services like consul have Nodeport for protocol TCP and UDP
+                # defined with same port number and so kubernetes cannot patch the
+                # file with a strategic merge. So we use apply here.
+                # https://github.com/kubernetes/kubernetes/issues/105610
+                service.metadata.managedFields = None
+                self.kube.apply(service, field_manager="sunbeam")
 
         return Result(ResultType.COMPLETED)
 
@@ -490,6 +549,8 @@ class PatchLoadBalancerServicesIPPoolStep(BaseStep, abc.ABC):
         self,
         client: Client,
         pool_name: str,
+        # Ignore errors if service of type LoadBalancer is not found
+        ignore_errors: bool = False,
     ):
         super().__init__(
             "Patch LoadBalancer services",
@@ -497,11 +558,33 @@ class PatchLoadBalancerServicesIPPoolStep(BaseStep, abc.ABC):
         )
         self.client = client
         self.pool_name = pool_name
+        self.ignore_errors = ignore_errors
         self.lb_pool_annotation = K8SHelper.get_loadbalancer_address_pool_annotation()
         self.lb_ip_annotation = K8SHelper.get_loadbalancer_ip_annotation()
         self.lb_allocated_pool_annotation = (
             K8SHelper.get_loadbalancer_allocated_pool_annotation()
         )
+
+    def _check_ippool_exists(self, kube_client: "l_client.Client") -> Result:
+        """Check if the specified IP pool exists.
+
+        :param kube_client: Kubernetes client instance
+        :return: Result with SKIPPED if pool doesn't exist, COMPLETED if it exists,
+                 or FAILED on error
+        """
+        lbpool_resource = K8SHelper.get_lightkube_loadbalancer_resource()
+        lbpool_model = K8SHelper.get_loadbalancer_namespace()
+        try:
+            pools = kube_client.list(lbpool_resource, namespace=lbpool_model)
+            pool_names = [pool.metadata.name for pool in pools if pool.metadata]
+            if self.pool_name not in pool_names:
+                LOG.debug(f"IPAddresspool {self.pool_name} does not exist, skipping")
+                return Result(ResultType.SKIPPED)
+        except l_exceptions.ApiError as e:
+            LOG.debug("Error listing load balancer pools", exc_info=True)
+            return Result(ResultType.FAILED, str(e))
+
+        return Result(ResultType.COMPLETED)
 
     @abc.abstractmethod
     def services(self) -> list[str]:
@@ -576,8 +659,12 @@ class PatchLoadBalancerServicesIPPoolStep(BaseStep, abc.ABC):
                 f" is not updated to {pool_name}"
             )
 
-    def run(self, status: Status | None = None) -> Result:
-        """Patch LoadBalancer services annotations with LB IP pool."""
+    def is_skip(self, status: Status | None = None) -> Result:
+        """Determines if the step should be skipped or not.
+
+        :return: ResultType.SKIPPED if the Step should be skipped,
+                ResultType.COMPLETED or ResultType.FAILED otherwise
+        """
         try:
             self.kubeconfig = read_config(self.client, K8SHelper.get_kubeconfig_key())
         except ConfigItemNotFoundException:
@@ -591,11 +678,40 @@ class PatchLoadBalancerServicesIPPoolStep(BaseStep, abc.ABC):
             LOG.debug("Error creating k8s client", exc_info=True)
             return Result(ResultType.FAILED, str(e))
 
+        # Check if pool exists
+        pool_check_result = self._check_ippool_exists(self.kube)
+        if pool_check_result.result_type != ResultType.COMPLETED:
+            return pool_check_result
+
+        return Result(ResultType.COMPLETED)
+
+    def run(self, status: Status | None = None) -> Result:  # noqa: C901
+        """Patch LoadBalancer services annotations with LB IP pool."""
         for service_name in self.services():
             try:
                 service = self._get_service(service_name, find_lb=True)
             except l_exceptions.ApiError as e:
+                if self.ignore_errors and e.status.code == 404:
+                    message = (
+                        f"Service {service_name!r} of type LoadBalancer not found, "
+                        "skipping as ignore_errors is set"
+                    )
+                    LOG.debug(message)
+                    continue
                 return Result(ResultType.FAILED, str(e))
+
+            if (
+                self.ignore_errors
+                and service.spec
+                and service.spec.type != "LoadBalancer"
+            ):
+                message = (
+                    f"Service {service_name!r} is not of type LoadBalancer, "
+                    "skipping as ignore_errors is set"
+                )
+                LOG.debug(message)
+                continue
+
             if not service.metadata:
                 return Result(
                     ResultType.FAILED, f"k8s service {service_name!r} has no metadata"
@@ -637,10 +753,15 @@ class PatchLoadBalancerServicesIPPoolStep(BaseStep, abc.ABC):
                     )
                     service_annotations.pop(self.lb_allocated_pool_annotation)
                 LOG.debug(
-                    f"Patching {service_name!r} to use annotation "
+                    f"Updating {service_name!r} to use annotation "
                     f"{self.lb_pool_annotation!r} with value {self.pool_name!r}"
                 )
-                self.kube.patch(core_v1.Service, service_name, obj=service)
+                # Some services like consul have Nodeport for protocol TCP and UDP
+                # defined with same port number and so kubernetes cannot patch the
+                # file with a strategic merge. So we use apply here.
+                # https://github.com/kubernetes/kubernetes/issues/105610
+                service.metadata.managedFields = None
+                self.kube.apply(service, field_manager="sunbeam")
 
                 try:
                     self._wait_for_ip_allocated_from_pool_annotation_update(

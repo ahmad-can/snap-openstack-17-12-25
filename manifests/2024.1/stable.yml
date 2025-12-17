@@ -3,6 +3,8 @@ core:
     charms:
       cinder-volume:
         channel: 2024.1/stable
+        config:
+          snap-channel: 2024.1/stable
       cinder-volume-ceph:
         channel: 2024.1/stable
       cinder-k8s:
@@ -40,10 +42,13 @@ core:
         config:
           snap-channel: squid/stable
       microovn:
+        channel: 24.03/stable
+      openstack-network-agents:
+        channel: 2024.1/stable
+        config:
+          snap-channel: 2024.1/stable
+      microcluster-token-distributor:
         channel: latest/edge
-      traefik-k8s:
-        channel: latest/stable
-        revision: 236
 features:
   caas:
     software:

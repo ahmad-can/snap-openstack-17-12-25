@@ -8,11 +8,6 @@ import pydantic
 
 from sunbeam.clusterd.client import Client
 from sunbeam.clusterd.service import ClusterServiceUnavailableException
-from sunbeam.commands.configure import (
-    CLOUD_CONFIG_SECTION,
-    ext_net_questions,
-    user_questions,
-)
 from sunbeam.commands.proxy import proxy_questions
 from sunbeam.core.deployment import PROXY_CONFIG_KEY, Deployment, Networks
 from sunbeam.core.k8s import K8SHelper
@@ -22,6 +17,11 @@ from sunbeam.core.openstack import (
     generate_endpoint_preseed_questions,
 )
 from sunbeam.core.questions import Question, QuestionBank, load_answers, show_questions
+from sunbeam.steps.configure import (
+    CLOUD_CONFIG_SECTION,
+    ext_net_questions,
+    user_questions,
+)
 from sunbeam.steps.openstack import (
     TOPOLOGY_KEY,
     database_topology_questions,
@@ -42,6 +42,7 @@ class RoleTags(enum.Enum):
     NETWORK = "network"
     JUJU_CONTROLLER = "juju-controller"
     SUNBEAM = "sunbeam"
+    REGION_CONTROLLER = "region_controller"
 
     @classmethod
     def values(cls) -> list[str]:
@@ -56,6 +57,11 @@ ROLE_NETWORK_MAPPING = {
         Networks.PUBLIC,
         Networks.STORAGE,
     ],
+    RoleTags.REGION_CONTROLLER: [
+        Networks.INTERNAL,
+        Networks.MANAGEMENT,
+        Networks.PUBLIC,
+    ],
     RoleTags.COMPUTE: [
         Networks.DATA,
         Networks.INTERNAL,
@@ -63,7 +69,6 @@ ROLE_NETWORK_MAPPING = {
         Networks.STORAGE,
     ],
     RoleTags.STORAGE: [
-        Networks.DATA,
         Networks.INTERNAL,
         Networks.MANAGEMENT,
         Networks.STORAGE,
@@ -135,6 +140,11 @@ class MaasDeployment(Deployment):
     def internal_api_label(self) -> str:
         """Return internal API label."""
         return self.name + "-internal-api"
+
+    @property
+    def storage_ippool_label(self) -> str:
+        """Return storage ippool label."""
+        return self.name + "-storage-ippool"
 
     @pydantic.validator("type")
     def type_validator(cls, v: str, values: dict) -> str:  # noqa N805
@@ -327,6 +337,11 @@ class MaasDeployment(Deployment):
     def public_ip_pool(self) -> str:
         """Name of the public IP pool."""
         return self.public_api_label
+
+    @property
+    def storage_ip_pool(self) -> str:
+        """Name of the storage IP pool."""
+        return self.storage_ippool_label
 
 
 def is_maas_deployment(deployment: Deployment) -> TypeGuard[MaasDeployment]:

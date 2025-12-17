@@ -577,6 +577,50 @@ def test_jhelper_add_k8s_cloud_unsupported_kubeconfig(jhelper: jujulib.JujuHelpe
         jhelper.add_k8s_cloud("k8s", "k8s-creds", kubeconfig)
 
 
+def test_jhelper_update_k8s_cloud(jhelper: jujulib.JujuHelper):
+    """Test update_k8s_cloud generates correct cloud definition structure."""
+    kubeconfig = yaml.safe_load(kubeconfig_yaml)
+
+    with patch("tempfile.NamedTemporaryFile") as mock_tempfile:
+        mock_file = MagicMock()
+        mock_file.name = "/tmp/test.yaml"
+        mock_tempfile.return_value.__enter__.return_value = mock_file
+
+        jhelper.update_k8s_cloud("k8s", kubeconfig)
+
+        # Verify cli was called with correct arguments
+        jhelper._juju.cli.assert_called_once_with(
+            "update-cloud",
+            "--controller",
+            "test",
+            "k8s",
+            "-f",
+            "/tmp/test.yaml",
+            include_model=False,
+        )
+
+        # Verify the cloud definition was written
+        assert mock_file.write.called
+        written_content = mock_file.write.call_args[0][0]
+        cloud_def = yaml.safe_load(written_content)
+
+        # Verify cloud structure
+        assert "k8s" in cloud_def
+        assert cloud_def["k8s"]["type"] == "kubernetes"
+        assert cloud_def["k8s"]["auth-types"] == ["oauth2", "clientcertificate"]
+        assert "ca_certificates" in cloud_def["k8s"]
+        assert cloud_def["k8s"]["endpoint"] == "https://10.5.1.180:16443"
+        assert cloud_def["k8s"]["host_cloud_region"] == "k8s/localhost"
+
+        # Verify regions structure (dict, not list)
+        assert isinstance(cloud_def["k8s"]["regions"], dict)
+        assert "localhost" in cloud_def["k8s"]["regions"]
+        assert (
+            cloud_def["k8s"]["regions"]["localhost"]["endpoint"]
+            == "https://10.5.1.180:16443"
+        )
+
+
 def test_get_available_charm_revision(jhelper: jujulib.JujuHelper, juju):
     cmd_out = {
         "channels": {
@@ -855,3 +899,54 @@ def test_is_desired_status_achieved(
         expected_workload_status_message,
     )
     assert result == expected_result
+
+
+def test_get_relation_map(jhelper, status, juju):
+    status.apps["app"] = Mock(units={"app/0": Mock(leader=True)})
+    juju.exec = Mock(
+        side_effect=[
+            Mock(return_code=0, stdout="121"),
+            Mock(return_code=0, stdout="traefik/0"),
+        ]
+    )
+
+    relation_map = jhelper.get_relation_map("app", "certificates", "test-model")
+    expected_map = {"121": "traefik/0"}
+    assert relation_map == expected_map
+
+
+def test_get_relation_map_no_leader(jhelper, status):
+    status.apps["app"] = Mock(units={"app/0": Mock(leader=False)})
+
+    with pytest.raises(jujulib.JujuException):
+        jhelper.get_relation_map("app", "certificates", "test-model")
+
+
+def test_get_relation_map_exec_fail(jhelper, status, juju):
+    status.apps["app"] = Mock(units={"app/0": Mock(leader=True)})
+    juju.exec = Mock(side_effect=jubilant.TaskError("exec failed"))
+
+    with pytest.raises(jujulib.JujuException):
+        jhelper.get_relation_map("app", "certificates", "test-model")
+
+
+def test_get_relation_map_exec_returns_nonzero(jhelper, status, juju):
+    status.apps["app"] = Mock(units={"app/0": Mock(leader=True)})
+    juju.exec = Mock(
+        side_effect=[
+            Mock(return_code=1, stdout=""),
+            Mock(return_code=0, stdout="traefik/0"),
+        ]
+    )
+
+    with pytest.raises(jujulib.JujuException):
+        jhelper.get_relation_map("app", "certificates", "test-model")
+
+
+def test_get_relation_map_no_related_units(jhelper, status):
+    status.apps["app"] = Mock(
+        units={"app/0": Mock(leader=True), "app/1": Mock(leader=False)}
+    )
+
+    with pytest.raises(jujulib.JujuException):
+        jhelper.get_relation_map("app", "certificates", "test-model")
